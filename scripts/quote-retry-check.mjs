@@ -14,7 +14,7 @@ const steamId='76561198000000000';
 let mode='stable',goodsPages=0,buyRequests=[],sellRequests=0,sequence=0,app=null,signalSubmit=null;
 const vendorOrders=new Map();
 function reset(next){mode=next;goodsPages=0;sellRequests=0;buyRequests=[];sequence=0;vendorOrders.clear();}
-const html=revision=>`<!doctype html><html><body>
+const html=revision=>`<!doctype html><html><head><meta charset="utf-8"></head><body>
 <script>
 window.g={user:{id:'fixture',steamid:'${steamId}'},currency:{code:'CNY'}};
 window.MultiSteamId=()=>({get_steamid:()=>'${steamId}'});
@@ -23,7 +23,7 @@ window.MultiSteamId=()=>({get_steamid:()=>'${steamId}'});
 <input id="batch-buy-max-price" value="9.99"><input id="batch-buy-num" value="1">
 <span class="total_amount">0.00</span><button class="i_Btn_main">购买预览</button></div>
 <div id="j_popup_epay" style="display:none">
-<div class="pay-item" data-value="1" data-free_password="true">网易余额</div>
+<div class="pay-item" data-value="43" data-free_password="true">BUFF可用资金</div>
 <span class="total_price">0.00</span><button class="pay-btn">确认付款</button></div>
 <script>
 const dlg=document.querySelector('#j_popup_batchbuy'),cash=document.querySelector('#j_popup_epay');
@@ -50,7 +50,7 @@ dlg.querySelector('.i_Btn_main').onclick=async()=>{
 cash.querySelector('.pay-btn').onclick=async()=>{
  for(const order of orders.slice(0,Number(document.querySelector('#batch-buy-num').value))){
   const response=await fetch('/api/market/goods/buy',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({goods_id:'1',sell_order_id:order.id,price:mode==='guard-reprice'?'2.01':order.price,pay_method:1,steamid:'${steamId}'})});
+   body:JSON.stringify({goods_id:'1',sell_order_id:order.id,price:mode==='guard-reprice'?'2.01':order.price,pay_method:43,steamid:'${steamId}'})});
   await response.json();
  }
 };
@@ -66,7 +66,7 @@ const vendor=http.createServer(async(req,res)=>{
   if(mode==='delayed')await new Promise(resolve=>setTimeout(resolve,550));
   const revision=Number(url.searchParams.get('revision'));
   const cents=mode==='repriced'&&revision>=2?201:mode==='below-minimum'?199:mode==='ratio-boundary'?210:200;
-  const items=[1,2,3].map(n=>({id:'SELL-'+n,goods_id:'1',price:(cents/100).toFixed(2)}))
+  const items=[1,2,3].map(n=>({id:'SELL-'+n,goods_id:'1',mode:2,price:(cents/100).toFixed(2)}))
    .filter(order=>Number(order.price)<=Number(url.searchParams.get('max_price'))&&!buyRequests.some(b=>b.sell_order_id===order.id));
   return res.end(JSON.stringify({code:'OK',data:{items}}));
  }

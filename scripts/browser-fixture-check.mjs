@@ -4,12 +4,12 @@ import {BuffBrowser,loadPlaywright} from '../buff-browser.mjs';
 
 const steamId='76561198000000000';
 let buyCount=0,login=true,free=true,price=0.1,paymentState='TO_DELIVER',freshReceipt=false,mixed=false;
-const html=id=>`<!doctype html><html><body><script>
+const html=id=>`<!doctype html><html><head><meta charset="utf-8"></head><body><script>
 window.g={user:${login?`{id:'fixture',steamid:'${steamId}'}`:'null'},currency:{code:'CNY'}};
 window.MultiSteamId=()=>({get_steamid:()=>${login?`'${steamId}'`:'null'}});
 </script><button id="batch-buy-btn">批量购买</button>
 <div id="j_popup_batchbuy" style="display:none"><input id="batch-buy-max-price" value="0.10"><input id="batch-buy-num" value="1"><span class="total_amount">0.10</span><button class="i_Btn_main">购买预览</button></div>
-<div id="j_popup_epay" style="display:none"><div class="pay-item" data-value="1" data-free_password="${free}">网易余额</div><span class="total_price">0.10</span><button class="pay-btn">确认付款</button></div>
+<div id="j_popup_epay" style="display:none"><div class="pay-item" data-value="43" data-free_password="${free}">BUFF可用资金</div><span class="total_price">0.10</span><button class="pay-btn">确认付款</button></div>
 <script>
 const goods='${id}',dlg=document.querySelector('#j_popup_batchbuy'),cash=document.querySelector('#j_popup_epay');let orders=[];
 function total(){const n=Number(document.querySelector('#batch-buy-num').value);const amount=orders.slice(0,n).reduce((v,o)=>v+Number(o.price),0).toFixed(2);document.querySelector('.total_amount').textContent=amount;document.querySelector('.total_price').textContent=amount;}
@@ -18,14 +18,14 @@ document.querySelector('#batch-buy-btn').onclick=async()=>{dlg.style.display='bl
 document.querySelector('#batch-buy-max-price').onchange=fetchOrders;
 document.querySelector('#batch-buy-num').onchange=total;
 dlg.querySelector('.i_Btn_main').onclick=async()=>{await fetch('/api/market/goods/batch_buy/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goods_id:goods})});cash.style.display='block';};
-cash.querySelector('.pay-btn').onclick=async()=>{for(const o of orders.slice(0,Number(document.querySelector('#batch-buy-num').value))){await fetch('/api/market/goods/buy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goods_id:goods,sell_order_id:o.id,price:o.price,pay_method:1,steamid:'${steamId}'})});}};
+cash.querySelector('.pay-btn').onclick=async()=>{for(const o of orders.slice(0,Number(document.querySelector('#batch-buy-num').value))){await fetch('/api/market/goods/buy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goods_id:goods,sell_order_id:o.id,price:o.price,pay_method:43,steamid:'${steamId}'})});}};
 </script></body></html>`;
 const server=http.createServer(async(req,res)=>{
  const u=new URL(req.url,'http://127.0.0.1');res.setHeader('Content-Type','application/json');
  if(u.pathname.startsWith('/goods/')){res.setHeader('Content-Type','text/html');return res.end(html(u.pathname.split('/').at(-1)));}
  if(u.pathname==='/market/buy_order/history'){res.setHeader('Content-Type','text/html');return res.end(html('1')+(freshReceipt?`<script>fetch('/api/market/bill_order/batch/info?bill_orders=${u.searchParams.get('search')}')</script>`:''));}
  if(u.pathname==='/api/market/bill_order/batch/info')return res.end(JSON.stringify({code:'OK',data:{items:[{id:u.searchParams.get('bill_orders'),state:'SUCCESS',price:'0.10'}]}}));
- if(u.pathname.endsWith('/sell_order'))return res.end(JSON.stringify({code:'OK',data:{items:[1,2,3].map(n=>({id:'SELL-'+n,goods_id:u.searchParams.get('goods_id'),price:(price+(mixed?(n-1)*.01:0)).toFixed(2)})).filter(o=>Number(o.price)<=Number(u.searchParams.get('max_price')))}}));
+ if(u.pathname.endsWith('/sell_order'))return res.end(JSON.stringify({code:'OK',data:{items:[1,2,3].map(n=>({id:'SELL-'+n,goods_id:u.searchParams.get('goods_id'),mode:2,price:(price+(mixed?(n-1)*.01:0)).toFixed(2)})).filter(o=>Number(o.price)<=Number(u.searchParams.get('max_price')))}}));
  if(u.pathname.endsWith('/preview'))return res.end(JSON.stringify({code:'OK',data:{price:'0.10'}}));
  if(u.pathname.endsWith('/goods/buy')){let body='';for await(const c of req)body+=c;const data=JSON.parse(body);buyCount++;return res.end(JSON.stringify({code:'OK',data:{id:'ORDER-'+buyCount,state:paymentState,price:data.price}}));}
  return res.end('{}');
@@ -41,7 +41,7 @@ try{
  const equalFloor=await browser.inspect({buffId:'1',bidNet:100},{...settings,minUnitPrice:10});assert.deepEqual(equalFloor.depth,quote.depth);
  mixed=true;const belowFloor=await browser.inspect({buffId:'1',bidNet:100},{...settings,minUnitPrice:11});assert.deepEqual(belowFloor.depth,[],'bulk UI must skip a good with low offers instead of selecting more expensive copies');mixed=false;
  const plan={buffId:'1',bidNet:100,quantity:2,unitCost:10,maxPrice:10,minUnitPrice:10,totalCost:20,steamId};
- const result=await browser.buy(plan,settings);assert.equal(result.status,'paid');assert.equal(result.totalCost,20);assert.equal(result.orders.length,2);assert.equal(result.final,true);
+ const result=await browser.buy(plan,settings);assert.equal(result.status,'paid',result.error);assert.equal(result.totalCost,20);assert.equal(result.orders.length,2);assert.equal(result.final,true);
  const purchase={...plan,appid:730,orderRefs:result.orders.map(o=>o.id)};
  for(const id of purchase.orderRefs)browser.orderMap.set(id,{id,state:'SUCCESS',cost:10,source:'/api/market/bill_order/batch/info',observedAt:Date.now()-60000});
  const staleReceipt=await browser.reconcile(purchase,settings);assert.equal(staleReceipt.final,false,'old SUCCESS cache must not prove receipt');

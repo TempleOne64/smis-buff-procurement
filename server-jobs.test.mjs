@@ -23,6 +23,42 @@ async function temporary(options={}){
 async function post(app,route,payload={}){const response=await fetch(app.base+route,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});return {status:response.status,value:await response.json()};}
 function latch(){let release;const promise=new Promise(resolve=>{release=resolve;});return {promise,release};}
 const changed=()=>({status:'cancelled',final:true,orders:[],retryable:true,retryCode:'QUOTE_CHANGED',error:'BUFF 批量购买总价与核对卖单不一致，付款前重新核价'});
+const unsupported=()=>({status:'cancelled',final:true,orders:[],quantity:0,totalCost:0,skip:true,skipCode:'UNSUPPORTED_TRADE_MODE',error:'该饰品不同时支持 BUFF 可用资金付款和卖家发起报价'});
+function withCandidates(options={},ids=[1,2]){const s=state(options);s.snapshot.rows=ids.map(buffId=>({...s.snapshot.rows[0],buffId,cnName:`测试饰品 ${buffId}`}));return s;}
+
+test('核价时不支持指定付款和收货方式的候选只跳过一次，继续采购其他饰品',async()=>{
+ for(const useException of [false,true]){
+  const inspected=[],bought=[];const app=await temporary({browser:browser({inspect:async candidate=>{
+   inspected.push(candidate.buffId);if(candidate.buffId==='1'){if(useException)throw Object.assign(Error('不支持卖家发起报价'),{code:'UNSUPPORTED_TRADE_MODE'});return {buffId:candidate.buffId,steamId,depth:[],unsupported:true,skipCode:'UNSUPPORTED_TRADE_MODE',reason:'不支持 BUFF 可用资金'};}return browser().inspect(candidate);
+  },buy:async plan=>{bought.push(plan.buffId);return browser().buy(plan);}})});
+  try{app.store.save(withCandidates({budget:600}));await app.runJob();const s=app.view();assert.deepEqual(inspected,['1','2','2']);assert.deepEqual(bought,['2','2']);assert.equal(s.activeJob.status,'completed');assert.equal(s.activeJob.spent,600);assert.equal(s.activeJob.reserved,0);assert.equal(s.automation.lastSkipped.buffId,'1');assert.match(s.automation.lastSkipped.reason,/不支持/);assert.equal(s.events.filter(e=>e.type==='trade-mode-skip').length,1);assert.equal(s.purchases.length,2);}finally{await app.dispose();}
+ }
+});
+test('付款前安全跳过释放预留并立即改买其他饰品，不进行三次价格重试',async()=>{
+ const bought=[];const app=await temporary({browser:browser({buy:async plan=>{bought.push(plan.buffId);return plan.buffId==='1'?unsupported():browser().buy(plan);}})});
+ try{app.store.save(withCandidates({budget:600}));await app.runJob();const s=app.view();assert.deepEqual(bought,['1','2','2']);assert.equal(s.activeJob.status,'completed');assert.equal(s.activeJob.spent,600);assert.equal(s.activeJob.reserved,0);assert.deepEqual(s.purchases.map(p=>p.status),['cancelled','received','received']);assert.equal(s.automation.lastSkipped.stage,'buy');assert.equal(s.automation.lastSkipped.purchaseId,s.purchases[0].id);assert.equal(s.events.filter(e=>e.type==='trade-mode-skip').length,1);assert.equal(s.automation.lastRetry,undefined);}finally{await app.dispose();}
+});
+test('所有饰品不符合两种交易方式则结束任务保留全部余款，可见每件跳过原因',async()=>{
+ for(const stage of ['inspect','buy']){
+  const inspected=[],bought=[];const app=await temporary({browser:browser({inspect:async candidate=>{inspected.push(candidate.buffId);return stage==='inspect'?{buffId:candidate.buffId,steamId,depth:[],unsupported:true,skipCode:'UNSUPPORTED_TRADE_MODE',reason:'不支持卖家发起报价'}:browser().inspect(candidate);},buy:async plan=>{bought.push(plan.buffId);return unsupported();}})});
+  try{app.store.save(withCandidates({budget:600}));await app.runJob();const s=app.view();assert.deepEqual(inspected,['1','2']);assert.deepEqual(bought,stage==='buy'?['1','2']:[]);assert.equal(s.activeJob.status,'completed');assert.equal(s.activeJob.remaining,600);assert.equal(s.activeJob.reserved,0);assert.equal(s.ledger.purchaseQuantity,0);assert.match(s.activeJob.reason,/BUFF 可用资金.*卖家发起报价/);assert.equal(s.events.filter(e=>e.type==='trade-mode-skip').length,2);assert.equal(s.automation.lastSkipped.buffId,'2');}finally{await app.dispose();}
+ }
+});
+test('跳过标签不能释放未知付款、有订单或正成交金额，也不能开始第二笔采购',async()=>{
+ const results=[{...unsupported(),status:'unknown',final:false},{...unsupported(),final:false},{...unsupported(),orders:[{id:'POSSIBLE-PAID',cost:200,status:'paid'}]},{...unsupported(),quantity:1,totalCost:200}];
+ for(const result of results){
+  let buys=0;const app=await temporary({browser:browser({buy:async()=>{buys++;return result;}})});
+  try{app.store.save(withCandidates({budget:600}));await app.runJob();const s=app.view();assert.equal(buys,1);assert.equal(s.activeJob.status,'needs_action');assert.equal(s.purchases[0].status,'unknown');assert.equal(s.activeJob.reserved,400);assert.equal(s.activeJob.remaining,200);assert.equal(s.events.filter(e=>e.type==='trade-mode-skip').length,0);}finally{await app.dispose();}
+ }
+});
+test('跳过标签不覆盖已经明确确认的实付结果',async()=>{
+ let buys=0;const app=await temporary({browser:browser({buy:async plan=>{buys++;return {...unsupported(),...await browser().buy(plan)};}})});
+ try{app.store.save(state({budget:400}));await app.runJob();const s=app.view();assert.equal(buys,1);assert.equal(s.activeJob.status,'completed');assert.equal(s.activeJob.spent,400);assert.equal(s.activeJob.reserved,0);assert.equal(s.purchases[0].status,'received');assert.equal(s.events.filter(e=>e.type==='trade-mode-skip').length,0);}finally{await app.dispose();}
+});
+test('交易方式跳过与报价波动独立计数，剩余报价持续不稳定仍暂停',async()=>{
+ const bought=[];const app=await temporary({browser:browser({buy:async plan=>{bought.push(plan.buffId);return plan.buffId==='1'?unsupported():changed();}})});
+ try{app.store.save(withCandidates({budget:400}));await app.runJob();const s=app.view();assert.deepEqual(bought,['1','2','2','2']);assert.equal(s.activeJob.status,'paused');assert.match(s.activeJob.reason,/卖单连续变化/);assert.equal(s.activeJob.remaining,400);assert.equal(s.activeJob.reserved,0);assert.equal(s.automation.lastSkipped.buffId,'1');assert.equal(s.automation.lastRetry.buffId,'2');}finally{await app.dispose();}
+});
 
 test('未付款价格波动释放本批预算并自动重新核价，不中止任务',async()=>{
  let inspections=0,buys=0;const app=await temporary({browser:browser({inspect:async candidate=>{inspections++;return browser().inspect(candidate);},buy:async plan=>{buys++;return buys===1?changed():browser().buy(plan);}})});
@@ -106,7 +142,7 @@ test('付款未知停止连续购买、冻结本批、再次运行拒绝重买',
 });
 test('明确付款但收货动作失败保留已付凭证并停止下一批',async()=>{
  let buys=0;const app=await temporary({browser:browser({buy:async plan=>{buys++;return {...await browser().buy(plan),status:'paid',orders:(await browser().buy(plan)).orders.map(o=>({...o,status:'paid'})),receiptError:'收货报价按钮超时'};}})});
- try{app.store.save(state());await app.runJob();assert.equal(buys,1);assert.equal(app.view().activeJob.status,'needs_action');assert.equal(app.view().purchases[0].status,'paid');assert.equal(app.view().activeJob.spent,400);assert.equal(app.view().activeJob.reserved,0);}finally{await app.dispose();}
+ try{app.store.save(state());await app.runJob();assert.equal(buys,1);assert.equal(app.view().activeJob.status,'needs_action');assert.equal(app.view().purchases[0].status,'paid');assert.equal(app.store.read().purchases[0].receiptError,'收货报价按钮超时');assert.equal(app.view().activeJob.spent,400);assert.equal(app.view().activeJob.reserved,0);}finally{await app.dispose();}
 });
 test('核价期间暂停不提交订单，不自动把用户暂停改成需处理',async()=>{
  let buys=0;const entered=latch(),blocked=latch();const app=await temporary({browser:browser({inspect:async candidate=>{entered.release();await blocked.promise;return browser().inspect(candidate);},buy:async()=>{buys++;throw Error('不应支付');}})});

@@ -7,19 +7,19 @@ import {createApp} from '../server.mjs';
 import {BuffBrowser,loadPlaywright} from '../buff-browser.mjs';
 
 // This vendor fixture is entirely local. No external orders or payment requests are made.
-const steamId='76561198000000000',stock=Array.from({length:20},(_,n)=>({id:'SELL-'+n,goods_id:'1',price:'0.10'}));
+const steamId='76561198000000000',stock=Array.from({length:20},(_,n)=>({id:'SELL-'+n,goods_id:'1',mode:2,price:'0.10'}));
 const vendorOrders=new Map();let sequence=0,app;
-const html=`<!doctype html><html><body>
+const html=`<!doctype html><html><head><meta charset="utf-8"></head><body>
 <script>window.g={user:{id:'fixture',steamid:'${steamId}'},currency:{code:'CNY'}};window.MultiSteamId=()=>({get_steamid:()=>'${steamId}'});</script>
 <button id="batch-buy-btn">批量购买</button><div id="j_popup_batchbuy" style="display:none"><input id="batch-buy-max-price" value="0.10"><input id="batch-buy-num" value="1"><span class="total_amount">0.10</span><button class="i_Btn_main">购买预览</button></div>
-<div id="j_popup_epay" style="display:none"><div class="pay-item" data-value="1" data-free_password="true">网易余额</div><span class="total_price">0.10</span><button class="pay-btn">确认付款</button></div>
+<div id="j_popup_epay" style="display:none"><div class="pay-item" data-value="43" data-free_password="true">BUFF可用资金</div><span class="total_price">0.10</span><button class="pay-btn">确认付款</button></div>
 <script>
 const dlg=document.querySelector('#j_popup_batchbuy'),cash=document.querySelector('#j_popup_epay');let orders=[];
 function total(){const qty=Number(document.querySelector('#batch-buy-num').value);const amount=orders.slice(0,qty).reduce((n,o)=>n+Number(o.price),0).toFixed(2);document.querySelector('.total_amount').textContent=amount;document.querySelector('.total_price').textContent=amount;}
 async function fetchOrders(){const max=document.querySelector('#batch-buy-max-price').value;const j=await(await fetch('/api/market/goods/sell_order?goods_id=1&max_price='+max)).json();orders=j.data.items;total();}
 document.querySelector('#batch-buy-btn').onclick=async()=>{dlg.style.display='block';await fetchOrders();};document.querySelector('#batch-buy-max-price').onchange=fetchOrders;document.querySelector('#batch-buy-num').onchange=total;
 dlg.querySelector('.i_Btn_main').onclick=async()=>{await fetch('/api/market/goods/batch_buy/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});cash.style.display='block';};
-cash.querySelector('.pay-btn').onclick=async()=>{for(const order of orders.slice(0,Number(document.querySelector('#batch-buy-num').value)))await fetch('/api/market/goods/buy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goods_id:'1',sell_order_id:order.id,price:order.price,pay_method:1,steamid:'${steamId}'})});};
+cash.querySelector('.pay-btn').onclick=async()=>{for(const order of orders.slice(0,Number(document.querySelector('#batch-buy-num').value)))await fetch('/api/market/goods/buy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goods_id:'1',sell_order_id:order.id,price:order.price,pay_method:43,steamid:'${steamId}'})});};
 </script></body></html>`;
 const vendor=http.createServer(async(req,res)=>{
  const url=new URL(req.url,'http://127.0.0.1');res.setHeader('Content-Type','application/json');
