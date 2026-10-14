@@ -1,0 +1,19 @@
+{
+  "name": "steam-procurement",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test",
+    "check:browser": "node scripts/browser-fixture-check.mjs",
+    "check:workflow": "node scripts/job-workflow-check.mjs",
+    "check:dashboard": "node scripts/dashboard-workflow-check.mjs"
+  },
+  "optionalDependencies": {
+    "playwright": "1.62.1"
+  }
+}
