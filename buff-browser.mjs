@@ -34,6 +34,10 @@ function bodyObject(request){
 }
 function centsFromOrder(order){return priceCents(order?.price??order?.pay_price??order?.amount);}
 function methodIsFree(value){return value===true||value==='true'||value===1||value==='1';}
+function quoteChanged(message){const error=Error(message);error.code='QUOTE_CHANGED';return error;}
+async function within(promise,timeoutMs,message){
+ let timer;try{return await Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error(message)),timeoutMs);})]);}finally{clearTimeout(timer);}
+}
 
 export class BuffBrowser{
  constructor({profileDir=path.resolve('data/buff-profile'),onStatus=()=>{},canSubmit=()=>true,context=null,launchOptions={},baseURL=BUFF,timeoutMs=20000}={}){
@@ -83,12 +87,14 @@ export class BuffBrowser{
    const data=bodyObject(request),permit=this.permit;
    const id=String(data.sell_order_id||''),cost=priceCents(data.price),method=Number(data.pay_method);
    const known=permit?.orders.get(id);
-   if(!permit||!this.canSubmit(permit.plan)||!known||permit.used.has(id)||cost===null||cost!==known.unitCost||cost<permit.minUnitPrice||cost>permit.maxPrice||
-      String(data.goods_id)!==permit.buffId||String(data.steamid)!==permit.steamId||!paymentMethods.has(method)||permit.total+cost>permit.ceiling){
-    if(permit)permit.blocked=true;
+   if(permit?.blocked)return route.abort('blockedbyclient');
+   const controlChanged=!permit||!this.canSubmit(permit.plan)||String(data.goods_id)!==permit.buffId||String(data.steamid)!==permit.steamId||!paymentMethods.has(method)||permit.used.has(id)||cost===null;
+   const marketChanged=!known||cost!==known.unitCost||cost<permit?.minUnitPrice||cost>permit?.maxPrice||(permit&&permit.total+cost>permit.ceiling);
+   if(controlChanged||marketChanged){
+    if(permit){permit.blocked=true;permit.blockReason=controlChanged?'CONTROL_CHANGED':'QUOTE_CHANGED';}
     return route.abort('blockedbyclient');
    }
-   permit.used.add(id);permit.total+=cost;return route.continue();
+   permit.used.add(id);permit.requests.add(request);permit.total+=cost;return route.continue();
   });
  }
  async observe(response){
@@ -105,7 +111,7 @@ export class BuffBrowser{
   if(url.pathname.endsWith('/goods/buy')){
    const data=bodyObject(response.request());
    const event={code:json.code,id:json.data?.id?String(json.data.id):null,cost:priceCents(data.price),status:classifyOrder(json.data),error:json.error||null,sellId:String(data.sell_order_id||'')};
-   this.buyEvents.push(event);
+   if(this.permit?.requests?.has(response.request()))this.buyEvents.push(event);
    if(event.id)this.orderMap.set(event.id,{...json.data,id:event.id,cost:event.cost,observedAt:Date.now(),source:url.pathname});
   }
   if(url.pathname==='/api/market/bill_order/batch/info'&&json.code==='OK'){
@@ -140,6 +146,30 @@ export class BuffBrowser{
   });
  }
  async inspect(candidate,settings){return this.exclusive(()=>this.inspectPage(candidate,settings));}
+ async refreshSellOrders(dialog,buffId,maxPrice){
+  // Bind the quote to the request caused by this price change, not another
+  // response from the default dialog or an older filter request.
+  const pending=this.page.waitForRequest(request=>{
+   const url=new URL(request.url());return url.origin===this.baseURL&&url.pathname.endsWith('/goods/sell_order')&&String(url.searchParams.get('goods_id'))===buffId&&priceCents(url.searchParams.get('max_price'))===maxPrice;
+  },{timeout:this.timeoutMs});pending.catch(()=>{});
+  const price=dialog.locator('#batch-buy-max-price');await price.fill((maxPrice/100).toFixed(2));await price.dispatchEvent('change');
+  const request=await pending,response=await within(request.response(),this.timeoutMs,'BUFF 卖单响应超时，请检查网络');
+  if(!response||!response.ok())throw Error('BUFF 卖单请求未正常完成，请重新检查页面与网络');
+  const json=await within(response.json(),this.timeoutMs,'BUFF 卖单内容读取超时');
+  if(json.code!=='OK'||!Array.isArray(json.data?.items))throw Error('BUFF 未返回有效的实时卖单');
+  const orders=json.data.items.map(item=>({id:String(item.id||''),buffId:String(item.goods_id||buffId),unitCost:priceCents(item.price),raw:item})).filter(order=>order.id&&order.buffId===buffId&&positiveInt(order.unitCost)&&order.unitCost<=maxPrice).sort((a,b)=>a.unitCost-b.unitCost);
+  return orders;
+ }
+ async waitTotal(locator,expected,label){
+  let amount=null;const until=Date.now()+Math.min(this.timeoutMs,2500);
+  do{
+   amount=priceCents(await locator.first().innerText({timeout:this.timeoutMs}));
+   if(amount===expected)return;
+   await sleep(100);
+  }while(Date.now()<until);
+  if(amount===null)throw Error(`BUFF ${label}无法识别，请检查页面结构`);
+  throw quoteChanged(`BUFF ${label}与最新卖单暂未一致，自动重新核价`);
+ }
  async inspectPage(candidate,settings){
   if(!this.page||this.page.isClosed())throw Error('请先打开并登录 BUFF 专用浏览器');
   const buffId=String(candidate.buffId);if(!/^\d+$/.test(buffId))throw Error('BUFF 商品标识无效');
@@ -153,38 +183,40 @@ export class BuffBrowser{
   const dialog=this.page.locator('#j_popup_batchbuy');await dialog.waitFor({state:'visible',timeout:this.timeoutMs});
   const maxPrice=Math.ceil(candidate.bidNet*settings.ratio)-1;
   if(!positiveInt(maxPrice))throw Error('按采购比例没有有效最高价');
-  const price=dialog.locator('#batch-buy-max-price');await price.fill((maxPrice/100).toFixed(2));
-  await price.dispatchEvent('change');
-  const until=Date.now()+this.timeoutMs;
-  while(Date.now()<until){if(this.sellOrdersAt&&this.sellOrdersFor===buffId)break;await sleep(100);}
-  const matching=this.sellOrders.filter(o=>o.buffId===buffId&&o.unitCost<=maxPrice&&o.unitCost/candidate.bidNet<settings.ratio).sort((a,b)=>a.unitCost-b.unitCost);
+  const matching=(await this.refreshSellOrders(dialog,buffId,maxPrice)).filter(o=>o.unitCost/candidate.bidNet<settings.ratio);
   // BUFF bulk purchase picks the lowest offers. A low offer makes this item ineligible,
   // even if more expensive orders exist, rather than paying extra for the same item.
   const orders=matching.some(o=>o.unitCost<(settings.minUnitPrice??0))?[]:matching;
-  if(!this.sellOrdersAt||this.sellOrdersFor!==buffId)throw Error('BUFF 未返回可核对的真实卖单，已停止。');
   const grouped=new Map();for(const order of orders)grouped.set(order.unitCost,(grouped.get(order.unitCost)||0)+1);
   this.inspection={buffId,steamId:actor.steamId,checkedAt:new Date().toISOString(),maxPrice,orders,candidate};
   return {buffId,steamId:actor.steamId,depth:[...grouped].map(([unitCost,quantity])=>({unitCost,quantity})),checkedAt:this.inspection.checkedAt};
  }
  async buy(plan,settings){
   return this.exclusive(async()=>{
-   let submitted=false;
+   let paymentPermit=null;
+   this.buyEvents=[];
    try{
     if(settings.autoBuy!==true)throw Error('自动采购未开启');
     if(!positiveInt(plan.quantity)||!positiveInt(plan.totalCost))throw Error('采购计划金额或数量无效');
     const candidate={buffId:plan.buffId,name:plan.name,bidNet:plan.bidNet};
     await this.inspectPage(candidate,settings);
-    const inspected=this.inspection,orders=inspected.orders.slice(0,plan.quantity);
-    if(orders.length!==plan.quantity)throw Error('实际可买数量已经变化，重新分析后再采购');
-    const actualTotal=orders.reduce((n,o)=>n+o.unitCost,0);
+    let orders=this.inspection.orders.slice(0,plan.quantity);
+    if(orders.length!==plan.quantity)throw quoteChanged('实际可买数量已经变化，自动重新核价');
     const minUnitPrice=Math.max(plan.minUnitPrice??0,settings.minUnitPrice??0);
-    if(actualTotal>plan.totalCost||orders.some(o=>o.unitCost<minUnitPrice||o.unitCost>(plan.maxPrice??plan.unitCost)))throw Error('实际卖单价格不符合单件价格范围或预留预算，已停止');
+    const checkQuote=()=>{
+     if(orders.length!==plan.quantity||orders.some(o=>o.unitCost<minUnitPrice||o.unitCost>(plan.maxPrice??plan.unitCost)||o.unitCost/plan.bidNet>=(plan.ratioLimit??settings.ratio))||orders.reduce((n,o)=>n+o.unitCost,0)>plan.totalCost)throw quoteChanged('实时价格或数量发生变化，按采购条件重新规划');
+    };checkQuote();
     const dialog=this.page.locator('#j_popup_batchbuy');
-    // Match the precise plan price again before a preview can enter the cashier.
-    const max=Math.max(...orders.map(o=>o.unitCost));await dialog.locator('#batch-buy-max-price').fill((max/100).toFixed(2));await dialog.locator('#batch-buy-max-price').dispatchEvent('change');await sleep(350);
+    // The UI rebuilds its selected offers when the maximum price changes.
+    // Re-read that exact response before comparing its asynchronously updated total.
+    const quoteMax=Math.max(...orders.map(o=>o.unitCost));
+    const refreshed=await this.refreshSellOrders(dialog,String(plan.buffId),quoteMax);
+    if(refreshed.some(o=>o.unitCost<minUnitPrice))throw quoteChanged('最新卖单低于单件最低采购金额，重新选择饰品');
+    orders=refreshed.slice(0,plan.quantity);checkQuote();
+    const actualTotal=orders.reduce((n,o)=>n+o.unitCost,0),max=Math.max(...orders.map(o=>o.unitCost));
     await dialog.locator('#batch-buy-num').fill(String(plan.quantity));await dialog.locator('#batch-buy-num').dispatchEvent('change');
-    const total=priceCents(await dialog.locator('.total_amount').first().innerText());
-    if(total===null||total!==actualTotal)throw Error('BUFF 批量购买总价与核对卖单不一致');
+    await this.waitTotal(dialog.locator('.total_amount'),actualTotal,'批量购买总价');
+    if(Number(await dialog.locator('#batch-buy-num').inputValue())!==plan.quantity)throw quoteChanged('BUFF 已调整可购买数量，自动重新核价');
     this.lastPreview=null;
     await dialog.locator('.i_Btn_main').click({timeout:this.timeoutMs}); // Preview only; payment not yet permitted.
     const cashier=this.page.locator('#j_popup_epay');await cashier.waitFor({state:'visible',timeout:this.timeoutMs});
@@ -192,21 +224,24 @@ export class BuffBrowser{
     const chosen=methods.find(m=>paymentMethods.has(m.value)&&methodIsFree(m.free));
     if(!chosen)throw Error('本次没有可用的 BUFF／网易余额免密付款选项；请在平台检查余额和免密设置');
     await cashier.locator('.pay-item').nth(chosen.index).click();
-    const paymentTotal=priceCents(await cashier.locator('.total_price').first().innerText());
-    if(paymentTotal===null||paymentTotal!==actualTotal||paymentTotal>plan.totalCost)throw Error('付款总额发生变化，未执行付款');
+    await this.waitTotal(cashier.locator('.total_price'),actualTotal,'付款总额');
     const actor=await this.readAccount(settings);if(actor.state!=='ready'||actor.steamId!==String(plan.steamId||settings.expectedSteamId))throw Error('付款前 Steam 收货账号核对失败');
     const pay=cashier.locator('.pay-btn');if(await pay.evaluate(node=>node.classList.contains('error-pay')||node.classList.contains('i_Btn_disabled')))throw Error('付款选项不可用，等待用户处理');
     if(!this.canSubmit(plan))throw Error('采购任务已暂停、结束或切换，未执行付款');
     this.buyEvents=[];
-    this.permit={plan,buffId:String(plan.buffId),steamId:actor.steamId,minUnitPrice,maxPrice:max,ceiling:plan.totalCost,orders:new Map(orders.map(o=>[o.id,o])),used:new Set(),total:0,blocked:false};
-    submitted=true;
+    paymentPermit={plan,buffId:String(plan.buffId),steamId:actor.steamId,minUnitPrice,maxPrice:max,ceiling:plan.totalCost,orders:new Map(orders.map(o=>[o.id,o])),used:new Set(),requests:new Set(),total:0,blocked:false,blockReason:null};
+    this.permit=paymentPermit;
     await pay.click({timeout:this.timeoutMs});
     const until=Date.now()+this.timeoutMs;
-    while(Date.now()<until){const unique=new Set(this.buyEvents.filter(e=>this.permit.orders.has(e.sellId)).map(e=>e.sellId));if(unique.size>=plan.quantity||this.permit.blocked)break;await sleep(150);}
-    const results=[...new Map(this.buyEvents.filter(e=>this.permit.orders.has(e.sellId)).map(e=>[e.sellId,e])).values()];
+    while(Date.now()<until){const unique=new Set(this.buyEvents.filter(e=>paymentPermit.orders.has(e.sellId)).map(e=>e.sellId));if(unique.size>=plan.quantity||paymentPermit.blocked||!this.context)break;await sleep(150);}
+    const results=[...new Map(this.buyEvents.filter(e=>paymentPermit.orders.has(e.sellId)).map(e=>[e.sellId,e])).values()];
     const paid=results.filter(e=>e.code==='OK'&&e.id&&positiveInt(e.cost)&&['paid','received'].includes(e.status));
     const evidence=results.filter(e=>e.code==='OK'&&e.id&&positiveInt(e.cost));
-    const final=results.length===plan.quantity&&paid.length===plan.quantity&&new Set(paid.map(e=>e.id)).size===plan.quantity&&!this.permit.blocked;
+    if(!paymentPermit.used.size&&!evidence.length){
+     if(paymentPermit.blockReason==='QUOTE_CHANGED')throw quoteChanged('付款前卖单已变化，未发出付款请求，自动重新核价');
+     throw Error(paymentPermit.blockReason==='CONTROL_CHANGED'?'采购状态、账号或付款方式已变化，未执行付款':'BUFF 未发出可核对的付款请求，请检查页面');
+    }
+    const final=results.length===plan.quantity&&paid.length===plan.quantity&&new Set(paid.map(e=>e.id)).size===plan.quantity&&!paymentPermit.blocked;
     const result={status:final?(paid.every(e=>e.status==='received')?'received':'paid'):'unknown',final,steamId:actor.steamId,quantity:paid.length,totalCost:evidence.reduce((n,e)=>n+e.cost,0),orders:evidence.map(e=>({id:e.id,cost:e.cost,status:e.status})),error:final?null:'付款提交后未能完整核对全部订单，保留预算并停止新购买。'};
     if(final){
      try{
@@ -219,9 +254,12 @@ export class BuffBrowser{
     }
     return result;
    }catch(e){
-    this.update({state:'blocked',error:e.message});
-    const known=submitted?[...new Map(this.buyEvents.filter(event=>event.code==='OK'&&event.id&&positiveInt(event.cost)&&this.permit?.orders.has(event.sellId)).map(event=>[event.id,event])).values()]:[];
-    return {status:submitted?'unknown':'cancelled',final:!submitted,steamId:this.current.steamId,quantity:known.length,totalCost:known.reduce((sum,event)=>sum+event.cost,0),orders:known.map(event=>({id:event.id,cost:event.cost,status:event.status})),error:e.message};
+    // Closing the browser revokes the global permit, but cannot erase evidence
+    // that a payment request already left this batch.
+    const known=[...new Map(this.buyEvents.filter(event=>event.code==='OK'&&event.id&&positiveInt(event.cost)&&paymentPermit?.orders.has(event.sellId)).map(event=>[event.id,event])).values()];
+    const submitted=(paymentPermit?.used.size??0)>0||known.length>0,retryable=!submitted&&e.code==='QUOTE_CHANGED';
+    if(!retryable)this.update({state:'blocked',error:e.message});
+    return {status:submitted?'unknown':'cancelled',final:!submitted,steamId:this.current.steamId,quantity:known.length,totalCost:known.reduce((sum,event)=>sum+event.cost,0),orders:known.map(event=>({id:event.id,cost:event.cost,status:event.status})),retryable,retryCode:retryable?'QUOTE_CHANGED':null,error:e.message};
    }finally{this.permit=null;this.receiptPermit=null;}
   });
  }

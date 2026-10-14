@@ -22,6 +22,44 @@ async function temporary(options={}){
 }
 async function post(app,route,payload={}){const response=await fetch(app.base+route,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});return {status:response.status,value:await response.json()};}
 function latch(){let release;const promise=new Promise(resolve=>{release=resolve;});return {promise,release};}
+const changed=()=>({status:'cancelled',final:true,orders:[],retryable:true,retryCode:'QUOTE_CHANGED',error:'BUFF 批量购买总价与核对卖单不一致，付款前重新核价'});
+
+test('未付款价格波动释放本批预算并自动重新核价，不中止任务',async()=>{
+ let inspections=0,buys=0;const app=await temporary({browser:browser({inspect:async candidate=>{inspections++;return browser().inspect(candidate);},buy:async plan=>{buys++;return buys===1?changed():browser().buy(plan);}})});
+ try{app.store.save(state({budget:400}));await app.runJob();const s=app.view();assert.equal(inspections,2);assert.equal(buys,2);assert.equal(s.activeJob.status,'completed');assert.equal(s.activeJob.spent,400);assert.equal(s.activeJob.reserved,0);assert.equal(s.ledger.purchaseQuantity,2);assert.deepEqual(s.purchases.map(p=>p.status),['cancelled','received']);assert.equal(s.automation.lastRetry.buffId,'1');}finally{await app.dispose();}
+});
+test('涨价后重新按预算缩小件数，不放宽预算和逐件比例',async()=>{
+ let inspections=0;const plans=[];const app=await temporary({browser:browser({inspect:async candidate=>{inspections++;return {...await browser().inspect(candidate),depth:[{unitCost:inspections===1?200:210,quantity:100}]};},buy:async plan=>{plans.push(plan);return plans.length===1?changed():browser().buy(plan);}})});
+ try{app.store.save(state({budget:400}));await app.runJob();const s=app.view();assert.deepEqual(plans.map(p=>[p.quantity,p.totalCost]),[[2,400],[1,210]]);assert.equal(s.activeJob.spent,210);assert.equal(s.activeJob.remaining,190);assert.equal(s.activeJob.reserved,0);assert.equal(s.activeJob.status,'completed');assert.equal(s.ledger.purchaseQuantity,1);assert.ok(plans[1].depth.every(d=>d.unitCost/plans[1].bidNet<.7));}finally{await app.dispose();}
+});
+test('重新核价后不满足最低金额或成本比例则不提交下一轮',async()=>{
+ for(const unitCost of [199,250]){
+  let inspections=0,buys=0;const app=await temporary({browser:browser({inspect:async candidate=>{inspections++;return {...await browser().inspect(candidate),depth:[{unitCost:inspections===1?200:unitCost,quantity:100}]};},buy:async()=>{buys++;return changed();}})});
+  try{const s=state({budget:400});s.settings.minUnitPrice=200;app.store.save(s);await app.runJob();assert.equal(inspections,2);assert.equal(buys,1);assert.equal(app.view().activeJob.status,'completed');assert.equal(app.view().activeJob.remaining,400);assert.equal(app.view().activeJob.reserved,0);assert.equal(app.view().ledger.purchaseQuantity,0);}finally{await app.dispose();}
+ }
+});
+test('同一候选连续三次未付款报价波动后尝试其他合格饰品',async()=>{
+ const buys=[];const app=await temporary({browser:browser({buy:async plan=>{buys.push(plan.buffId);return plan.buffId==='1'?changed():browser().buy(plan);}})});
+ try{const s=state({budget:210});s.snapshot.rows.push({...s.snapshot.rows[0],buffId:2,cnName:'测试饰品 B',buffSellPrice:2.1});app.store.save(s);await app.runJob();assert.deepEqual(buys,['1','1','1','2']);assert.equal(app.view().activeJob.status,'completed');assert.equal(app.view().activeJob.spent,210);assert.equal(app.view().activeJob.reserved,0);assert.equal(app.view().ledger.purchaseQuantity,1);}finally{await app.dispose();}
+});
+test('所有候选持续变动则暂停保留预算，手动继续允许重新尝试',async()=>{
+ let buys=0,stable=false;const app=await temporary({browser:browser({buy:async plan=>{buys++;return stable?browser().buy(plan):changed();}})});
+ try{app.store.save(state({budget:400}));await app.runJob();const s=app.view();assert.equal(buys,3);assert.equal(s.activeJob.status,'paused');assert.match(s.activeJob.reason,/卖单连续变化/);assert.equal(s.activeJob.remaining,400);assert.equal(s.activeJob.reserved,0);assert.equal(s.ledger.purchaseQuantity,0);stable=true;await app.runJob();assert.equal(buys,4);assert.equal(app.view().activeJob.status,'completed');assert.equal(app.view().activeJob.spent,400);}finally{await app.dispose();}
+});
+test('付款未知或有订单的取消，即使附带可重试标签也冻结且不重买',async()=>{
+ for(const result of [{...changed(),status:'unknown',final:false},{...changed(),orders:[{id:'PENDING-ORDER',cost:200,status:'paid'}]}]){
+  let buys=0;const app=await temporary({browser:browser({buy:async()=>{buys++;return result;}})});
+  try{app.store.save(state({budget:400}));await app.runJob();assert.equal(buys,1);assert.equal(app.view().activeJob.status,'needs_action');assert.equal(app.view().purchases[0].status,'unknown');assert.equal(app.view().activeJob.reserved,400);assert.equal(app.view().activeJob.remaining,0);}finally{await app.dispose();}
+ }
+});
+test('已确认付款结果带可重试标签仍按一次实付记账',async()=>{
+ let buys=0;const app=await temporary({browser:browser({buy:async plan=>{buys++;return {...await browser().buy(plan),retryable:true,retryCode:'QUOTE_CHANGED'};}})});
+ try{app.store.save(state({budget:400}));await app.runJob();assert.equal(buys,1);assert.equal(app.view().activeJob.status,'completed');assert.equal(app.view().activeJob.spent,400);assert.equal(app.view().ledger.purchaseQuantity,2);assert.equal(app.view().purchases[0].status,'received');}finally{await app.dispose();}
+});
+test('安全价格波动返回前用户暂停，释放本批预留但不重新核价或采购',async()=>{
+ let inspections=0,buys=0;const entered=latch(),blocked=latch();const app=await temporary({browser:browser({inspect:async candidate=>{inspections++;return browser().inspect(candidate);},buy:async()=>{buys++;entered.release();await blocked.promise;return changed();}})});
+ try{app.store.save(state({budget:400}));const id=app.view().activeJobId,task=app.runJob();await entered.promise;await post(app,'/api/command',{key:randomUUID(),type:'job-pause',payload:{id}});blocked.release();await task;assert.equal(inspections,1);assert.equal(buys,1);assert.equal(app.view().activeJob.status,'paused');assert.equal(app.view().activeJob.remaining,400);assert.equal(app.view().activeJob.reserved,0);assert.equal(app.view().purchases[0].status,'cancelled');}finally{blocked.release();await app.dispose();}
+});
 
 test('最低单价通过HTTP持久化，低价候选不采购，任务保留余款',async()=>{
  let inspections=0,buys=0;const app=await temporary({browser:browser({inspect:async()=>{inspections++;throw Error('低价候选不应核价');},buy:async()=>{buys++;throw Error('不应支付');}})});

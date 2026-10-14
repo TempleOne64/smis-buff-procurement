@@ -47,7 +47,7 @@ export async function createApp({dir=path.join(root,'data'),demo=false,fetcher=f
    browser=new BuffBrowser({profileDir:path.join(dir,'buff-profile'),canSubmit:plan=>{
     if(closed||!plan)return false;
     const s=store.read(),job=s.jobs.find(item=>item.id===s.activeJobId);
-    return !s.paused&&s.settings.autoBuy&&job?.status==='running'&&job.id===plan.jobId&&s.settings.expectedSteamId===browser.status().steamId&&(plan.minUnitPrice??0)>=s.settings.minUnitPrice;
+    return !s.paused&&s.settings.autoBuy&&job?.status==='running'&&job.id===plan.jobId&&s.settings.expectedSteamId===browser.status().steamId&&(plan.minUnitPrice??0)>=s.settings.minUnitPrice&&(plan.ratioLimit??s.settings.ratio)<=s.settings.ratio;
    }});
   }catch(error){browser=unavailableBrowser(`BUFF 浏览器暂不可用：${error.message}`);}
  }
@@ -88,14 +88,14 @@ export async function createApp({dir=path.join(root,'data'),demo=false,fetcher=f
   // A preview plans against a copy. It cannot start a real task or reserve money.
   s.activeJobId=id;job.status='running';return s;
  }
- async function inspectPlan({buffId,jobId,preview=false}={}){
+ async function inspectPlan({buffId,jobId,preview=false,excludeBuffIds=new Set()}={}){
   const state=preview?previewState(jobId):store.read(),gate=control(state);
   if(!gate.canBuy)throw fault(gate.reason,gate.gateCode?.toUpperCase());
   const lockedJobId=jobId||gate.jobId;
   if(!preview&&gate.jobId!==lockedJobId)throw fault('当前采购任务已变化，未执行采购');
   accountGate(state);
-  const candidates=opportunities(state).filter(q=>q.quantity>0&&(!buffId||q.buffId===String(buffId)));
-  if(!candidates.length)throw fault('当前没有满足成本比例、日成交量和本次剩余预算的候选','NO_ELIGIBLE');
+  const eligible=opportunities(state).filter(q=>q.quantity>0&&(!buffId||q.buffId===String(buffId))),candidates=eligible.filter(q=>!excludeBuffIds.has(q.buffId)),hasUnstable=eligible.some(q=>excludeBuffIds.has(q.buffId));
+  if(!candidates.length)throw hasUnstable?fault('合格饰品的卖单连续变化，已暂停本次任务，稍后可继续采购','QUOTES_UNSTABLE'):fault('当前没有满足成本比例、日成交量和本次剩余预算的候选','NO_ELIGIBLE');
   for(const candidate of candidates){
    const inspection=await browser.inspect(candidate,store.read().settings);
    if(closed)throw fault('程序正在关闭');
@@ -107,9 +107,10 @@ export async function createApp({dir=path.join(root,'data'),demo=false,fetcher=f
    try{return {candidate,inspection,plan:planPurchase(preview?previewState(jobId):store.read(),candidate,inspection)};}
    catch(error){if(error.code==='NO_ELIGIBLE')continue;throw error;}
   }
+  if(hasUnstable)throw fault('剩余合格饰品的卖单连续变化，已暂停本次任务，稍后可继续采购','QUOTES_UNSTABLE');
   throw fault('BUFF 实时可买档位不足、逐件比例不合格或剩余预算不足','NO_ELIGIBLE');
  }
- function automate({buy=false,buffId,jobId,fromRunner=false}={}){
+ function automate({buy=false,buffId,jobId,fromRunner=false,excludeBuffIds=new Set()}={}){
   if(automationPromise)return automationPromise;
   if(jobRunnerPromise&&!fromRunner)throw fault('采购任务正在运行，请等待本轮完成或暂停任务');
   if(browserPromise||reconcilePromise)throw fault('BUFF 浏览器正在启动或核对收货，请稍候');
@@ -118,7 +119,7 @@ export async function createApp({dir=path.join(root,'data'),demo=false,fetcher=f
    let purchaseId=null;
    try{
     const shouldBuy=buy&&store.read().settings.autoBuy;
-    const {candidate,inspection,plan}=await inspectPlan({buffId,jobId,preview:!shouldBuy});
+    const {candidate,inspection,plan}=await inspectPlan({buffId,jobId,preview:!shouldBuy,excludeBuffIds});
     if(closed)return null;
     saveAutomation({state:'preview',lastPreview:iso(),plan});
     if(!shouldBuy)return view();
@@ -135,6 +136,11 @@ export async function createApp({dir=path.join(root,'data'),demo=false,fetcher=f
     if(closed)return null;
     store.update('purchase-result',{purchaseId,result},state=>{applyBrowserResult(state,purchaseId,result);return state;});
     const final=store.read().purchases.find(p=>p.id===purchaseId),failed=['unknown','cancelled'].includes(final.status);
+    // Only a proven, unpaid cancellation may be replanned. Never retry paid,
+    // partial or unknown results even when a driver mistakenly labels them retryable.
+    if(final.status==='cancelled'&&result.status==='cancelled'&&result.final===true&&result.retryable===true&&result.retryCode==='QUOTE_CHANGED'&&Array.isArray(result.orders)&&result.orders.length===0&&!final.orderRefs.length){
+     throw Object.assign(fault(result.error||'BUFF 卖单价格已变化，正在重新核价','QUOTE_CHANGED'),{buffId:final.buffId});
+    }
     saveAutomation({state:failed?'blocked':'done',lastError:final.error||result.error||null});
     if(failed)throw fault(final.error||result.error||'本轮未明确完成采购，请检查 BUFF 订单');
     if(result.receiptError){setJobAttention(plan.jobId,'付款已确认，收货步骤需要处理：'+result.receiptError);throw fault('付款已确认，收货步骤需要处理：'+result.receiptError);}
@@ -143,7 +149,8 @@ export async function createApp({dir=path.join(root,'data'),demo=false,fetcher=f
     if(purchaseId&&!closed)store.update('purchase-error',{purchaseId,error:error.message},state=>{
      const p=state.purchases.find(p=>p.id===purchaseId);if(p?.status==='submitting'){p.status='unknown';p.error=error.message;p.updatedAt=iso();}return state;
     });
-    saveAutomation({state:'blocked',lastError:error.message});throw error;
+    if(error.code==='QUOTE_CHANGED')saveAutomation({state:'inspecting',lastError:null,lastRetry:{buffId:error.buffId,reason:error.message,at:iso()}});
+    else saveAutomation({state:'blocked',lastError:error.message});throw error;
    }finally{automationPromise=null;}
   });return automationPromise;
  }
@@ -170,6 +177,7 @@ export async function createApp({dir=path.join(root,'data'),demo=false,fetcher=f
   accountGate(s);
   store.command(randomUUID(),'job-start',{id:job.id});runningJobId=job.id;
   jobRunnerPromise=Promise.resolve().then(async()=>{
+   const quoteChanges=new Map(),excludeBuffIds=new Set();
    try{
     while(!closed){
      let state=store.read(),current=state.jobs.find(item=>item.id===job.id);
@@ -179,8 +187,17 @@ export async function createApp({dir=path.join(root,'data'),demo=false,fetcher=f
      if(gate.gateCode==='exhausted'){completeJob(job.id,'本次采购预算已用完');break;}
      if(['stale','sync_error'].includes(gate.gateCode)){await refresh({force:true});state=store.read();current=state.jobs.find(item=>item.id===job.id);if(current?.status!=='running'||state.paused||!state.settings.autoBuy)continue;gate=control(state);}
      if(!gate.canBuy)throw fault(gate.reason,gate.gateCode?.toUpperCase());
-     try{await automate({buy:true,jobId:job.id,fromRunner:true});}
+     try{await automate({buy:true,jobId:job.id,fromRunner:true,excludeBuffIds});quoteChanges.clear();}
      catch(error){
+      if(error.code==='QUOTE_CHANGED'){
+       const latest=store.read(),current=latest.jobs.find(item=>item.id===job.id);
+       if(current?.status!=='running'||latest.activeJobId!==job.id)break;
+       if(latest.paused||!latest.settings.autoBuy){pauseJob(job.id,latest.paused?'用户已暂停采购':'自动采购已关闭');break;}
+       const id=String(error.buffId),count=(quoteChanges.get(id)||0)+1;quoteChanges.set(id,count);
+       if(count>=3)excludeBuffIds.add(id);
+       await sleep(300);continue;
+      }
+      if(error.code==='QUOTES_UNSTABLE'){pauseJob(job.id,error.message);saveAutomation({state:'idle',lastError:error.message});break;}
       if(error.code==='NO_ELIGIBLE'){const latest=store.read();if(latest.jobs.find(item=>item.id===job.id)?.status==='running'&&!latest.paused&&latest.settings.autoBuy)completeJob(job.id,error.message);break;}
       throw error;
      }

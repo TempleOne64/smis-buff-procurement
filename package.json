@@ -11,7 +11,8 @@
     "test": "node --test",
     "check:browser": "node scripts/browser-fixture-check.mjs",
     "check:workflow": "node scripts/job-workflow-check.mjs",
-    "check:dashboard": "node scripts/dashboard-workflow-check.mjs"
+    "check:dashboard": "node scripts/dashboard-workflow-check.mjs",
+    "check:quotes": "node scripts/quote-retry-check.mjs"
   },
   "optionalDependencies": {
     "playwright": "1.62.1"
